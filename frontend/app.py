@@ -526,6 +526,7 @@ st.markdown(
 )
 
 
+
 # --------------------------------------------------
 # 3. Load configuration from the project root
 # --------------------------------------------------
@@ -533,12 +534,25 @@ st.markdown(
 ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env")
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_PUBLISHABLE_KEY = os.getenv(
-    "SUPABASE_PUBLISHABLE_KEY"
-)
-API_URL = os.getenv(
-    "API_URL", "http://127.0.0.1:8000"
+
+def get_setting(name, default=None):
+    """Read settings locally from .env or from Streamlit Cloud secrets."""
+    value = os.getenv(name)
+
+    if value:
+        return value
+
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+SUPABASE_URL = get_setting("SUPABASE_URL")
+SUPABASE_PUBLISHABLE_KEY = get_setting("SUPABASE_PUBLISHABLE_KEY")
+API_URL = get_setting(
+    "API_URL",
+    "http://127.0.0.1:8000"
 ).rstrip("/")
 
 
