@@ -1,0 +1,16 @@
+
+DEMO DOCUMENT — GENERAL STUDY GUIDANCE
+
+Topic: Effective Learning
+
+Break a large topic into smaller concepts. Learn the theory,
+write short notes, practise examples, and test your understanding
+without looking at the solution.
+
+For programming subjects, combine conceptual learning with
+small coding exercises. Review errors, identify why they happened,
+and practise similar problems.
+
+Use spaced revision to revisit important topics over multiple days.
+Use practice questions to identify weak areas and adjust the
+next study session accordingly.
