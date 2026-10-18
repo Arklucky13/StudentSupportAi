@@ -1,287 +1,184 @@
 
 from pathlib import Path
-import sys
+import os
 
-# --------------------------------------------------
-# 1. Configure project paths
-# --------------------------------------------------
-
-ROOT_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT_DIR))
-
-DOCUMENTS_DIR = ROOT_DIR / "sample_docs"
-
-# --------------------------------------------------
-# 2. Import required libraries
-# --------------------------------------------------
-
+from dotenv import load_dotenv
+from google import genai
 from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
 from backend.db.client import supabase
 
 # --------------------------------------------------
-# 3. Configuration
+# Configuration
 # --------------------------------------------------
 
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+ROOT_DIR = Path(__file__).resolve().parents[1]
+DOCS_DIR = ROOT_DIR / "sample_docs"
 
-CHUNK_SIZE = 180
-CHUNK_OVERLAP = 30
-BATCH_SIZE = 32
+load_dotenv(ROOT_DIR / ".env", override=True)
 
-ALLOWED_CATEGORIES = {
-    "academics",
-    "career",
-    "study",
-}
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
+    raise RuntimeError("GEMINI_API_KEY is missing from the root .env file.")
 
-ALLOWED_EXTENSIONS = {".txt", ".pdf"}
+client = genai.Client(api_key=api_key)
+
+EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_DIMENSIONS = 768
+CHUNK_WORDS = 180
+OVERLAP_WORDS = 30
+BATCH_SIZE = 50
+
+ALLOWED_CATEGORIES = {"academics", "career", "study"}
 
 
 # --------------------------------------------------
-# 4. Extract text from TXT and PDF files
+# Read TXT and PDF documents
 # --------------------------------------------------
 
-def extract_text(file_path: Path) -> str:
-    """Extract text from a TXT or PDF document."""
+def read_document(file_path: Path) -> str:
+    if file_path.suffix.lower() == ".txt":
+        return file_path.read_text(encoding="utf-8", errors="replace")
 
-    extension = file_path.suffix.lower()
-
-    if extension == ".txt":
-        return file_path.read_text(encoding="utf-8")
-
-    if extension == ".pdf":
+    if file_path.suffix.lower() == ".pdf":
         reader = PdfReader(str(file_path))
-        pages = []
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
 
-        for page in reader.pages:
-            pages.append(page.extract_text() or "")
-
-        return "\n".join(pages)
-
-    raise ValueError(
-        f"Unsupported file type: {extension}"
-    )
+    return ""
 
 
 # --------------------------------------------------
-# 5. Split text into overlapping chunks
+# Split text into overlapping chunks
 # --------------------------------------------------
 
-def split_into_chunks(
+def chunk_text(
     text: str,
-    chunk_size: int = CHUNK_SIZE,
-    overlap: int = CHUNK_OVERLAP,
+    chunk_words: int = CHUNK_WORDS,
+    overlap_words: int = OVERLAP_WORDS,
 ) -> list[str]:
-    """Split text into word-based chunks with overlap."""
-
     words = text.split()
 
     if not words:
         return []
 
-    if chunk_size <= 0:
-        raise ValueError("Chunk size must be positive.")
-
-    if overlap < 0 or overlap >= chunk_size:
-        raise ValueError(
-            "Overlap must be non-negative and smaller "
-            "than chunk size."
-        )
+    if overlap_words >= chunk_words:
+        raise ValueError("OVERLAP_WORDS must be smaller than CHUNK_WORDS.")
 
     chunks = []
-    step = chunk_size - overlap
+    step = chunk_words - overlap_words
 
     for start in range(0, len(words), step):
-        chunk_words = words[start:start + chunk_size]
-
-        if not chunk_words:
-            break
-
-        chunks.append(" ".join(chunk_words))
-
-        if start + chunk_size >= len(words):
-            break
+        chunk = " ".join(words[start:start + chunk_words])
+        if chunk:
+            chunks.append(chunk)
 
     return chunks
 
 
 # --------------------------------------------------
-# 6. Process and upload one document
+# Generate Gemini embeddings
 # --------------------------------------------------
 
-def ingest_file(
-    file_path: Path,
-    model: SentenceTransformer,
-) -> int:
-    """Extract, chunk, embed, and store one document."""
+def generate_embedding(text: str) -> list[float]:
+    response = client.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=text,
+        config={
+            "output_dimensionality": EMBEDDING_DIMENSIONS,
+            "task_type": "RETRIEVAL_DOCUMENT",
+        },
+    )
 
-    relative_path = file_path.relative_to(
-        DOCUMENTS_DIR
-    ).as_posix()
+    if not response.embeddings:
+        raise RuntimeError("Gemini returned no embedding.")
 
-    category = file_path.parent.name.lower()
+    embedding = response.embeddings[0].values
 
-    # Determine whether the folder is an allowed category.
-    if category not in ALLOWED_CATEGORIES:
-        print(
-            f"Skipping unknown category: {relative_path}"
-        )
-        return 0
-
-    # Extract document text.
-    try:
-        text = extract_text(file_path).strip()
-    except Exception as error:
-        print(
-            f"Could not read {relative_path}: {error}"
-        )
-        return 0
-
-    if not text:
-        print(f"No text found: {relative_path}")
-        return 0
-
-    # Create chunks.
-    chunks = split_into_chunks(text)
-
-    if not chunks:
-        print(f"No chunks created: {relative_path}")
-        return 0
-
-    print(f"\nProcessing: {relative_path}")
-    print(f"Category: {category}")
-    print(f"Chunks created: {len(chunks)}")
-
-    # Generate embeddings.
-    embeddings = model.encode(
-        chunks,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    ).tolist()
-
-    # Prepare all database rows before uploading.
-    rows = []
-
-    for index, chunk in enumerate(chunks):
-        rows.append(
-            {
-                "document_name": relative_path,
-                "category": category,
-                "chunk_index": index,
-                "content": chunk,
-                "embedding": embeddings[index],
-            }
+    if len(embedding) != EMBEDDING_DIMENSIONS:
+        raise RuntimeError(
+            f"Expected {EMBEDDING_DIMENSIONS} dimensions, "
+            f"received {len(embedding)}."
         )
 
-    # Remove the previous version of this document.
-    # This allows the document to be re-indexed.
-    try:
-        (
-            supabase.table("document_chunks")
-            .delete()
-            .eq("document_name", relative_path)
-            .eq("category", category)
-            .execute()
-        )
-
-        # Upload rows in batches.
-        for start in range(0, len(rows), BATCH_SIZE):
-            batch = rows[start:start + BATCH_SIZE]
-
-            (
-                supabase.table("document_chunks")
-                .insert(batch)
-                .execute()
-            )
-
-    except Exception as error:
-        print(
-            f"Supabase upload failed for "
-            f"{relative_path}: {error}"
-        )
-        raise
-
-    print(f"Successfully indexed: {relative_path}")
-
-    return len(chunks)
+    return embedding
 
 
 # --------------------------------------------------
-# 7. Main ingestion workflow
+# Discover documents and ingest chunks
 # --------------------------------------------------
 
 def main():
-    """Find documents and index them in Supabase."""
+    if not DOCS_DIR.exists():
+        raise FileNotFoundError(f"Documents folder not found: {DOCS_DIR}")
 
-    print("=" * 50)
-    print("STUDENT SUPPORT DOCUMENT INGESTION")
-    print("=" * 50)
-
-    # Verify the documents directory exists.
-    if not DOCUMENTS_DIR.exists():
-        raise FileNotFoundError(
-            f"Documents folder not found: {DOCUMENTS_DIR}"
-        )
-
-    # Discover PDF and TXT files recursively.
-    files = sorted(
+    document_paths = sorted(
         path
-        for path in DOCUMENTS_DIR.rglob("*")
-        if path.is_file()
-        and path.suffix.lower() in ALLOWED_EXTENSIONS
+        for path in DOCS_DIR.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".txt", ".pdf"}
     )
 
-    if not files:
-        print("No PDF or TXT documents found.")
-        print(f"Check this folder: {DOCUMENTS_DIR}")
+    if not document_paths:
+        print(f"No TXT/PDF documents found in {DOCS_DIR}")
         return
 
-    print(f"Documents discovered: {len(files)}")
-
-    # Load the embedding model once.
-    print("\nLoading embedding model...")
-    print(f"Model: {MODEL_NAME}")
-
-    model = SentenceTransformer(MODEL_NAME)
-
-    print("Embedding model loaded successfully.")
-
     total_chunks = 0
-    successful_files = 0
 
-    # Process each discovered document.
-    for file_path in files:
-        try:
-            chunks_indexed = ingest_file(
-                file_path,
-                model,
+    for file_path in document_paths:
+        relative_path = file_path.relative_to(DOCS_DIR)
+        parts = relative_path.parts
+
+        if len(parts) < 2 or parts[0].lower() not in ALLOWED_CATEGORIES:
+            print(f"Skipping document outside category folders: {relative_path}")
+            continue
+
+        category = parts[0].lower()
+        document_name = relative_path.as_posix()
+
+        print(f"\nProcessing: {document_name}")
+
+        text = read_document(file_path).strip()
+        chunks = chunk_text(text)
+
+        if not chunks:
+            print("  Skipping: no extractable text.")
+            continue
+
+        # Generate all embeddings before replacing stored data.
+        # This preserves existing chunks if embedding generation fails.
+        rows = []
+
+        for index, chunk in enumerate(chunks):
+            embedding = generate_embedding(chunk)
+
+            rows.append(
+                {
+                    "document_name": document_name,
+                    "category": category,
+                    "chunk_index": index,
+                    "content": chunk,
+                    "embedding": embedding,
+                }
             )
 
-            total_chunks += chunks_indexed
+            print(f"  Embedded chunk {index + 1}/{len(chunks)}")
 
-            if chunks_indexed > 0:
-                successful_files += 1
+        # Delete only this document from the new table.
+        supabase.table("document_chunks_gemini").delete().eq(
+            "document_name", document_name
+        ).eq("category", category).execute()
 
-        except Exception as error:
-            print(
-                f"Failed to process {file_path.name}: "
-                f"{error}"
-            )
+        # Upload in batches.
+        for start in range(0, len(rows), BATCH_SIZE):
+            batch = rows[start:start + BATCH_SIZE]
 
-    # Print final summary.
-    print("\n" + "=" * 50)
-    print("DOCUMENT INGESTION FINISHED")
-    print("=" * 50)
-    print(f"Files discovered: {len(files)}")
-    print(f"Files indexed: {successful_files}")
-    print(f"Chunks indexed: {total_chunks}")
-    print("=" * 50)
+            supabase.table("document_chunks_gemini").insert(
+                batch
+            ).execute()
 
+        total_chunks += len(rows)
+        print(f"  Stored {len(rows)} chunks.")
 
-# --------------------------------------------------
-# 8. Entry point
-# --------------------------------------------------
+    print(f"\nIngestion complete. Total chunks processed: {total_chunks}")
+
 
 if __name__ == "__main__":
     main()
